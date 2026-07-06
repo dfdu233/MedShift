@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+logs/
+report_assets/
+data/
+.huggingface/
+*.npy
+*.pkl
+data source
+models source
