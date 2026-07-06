@@ -3,7 +3,18 @@ import json
 import os
 import numpy as np
 from PIL import Image
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
+
+
+# Lazy-loaded sentence encoder
+_encoder = None
+
+def _get_encoder():
+    global _encoder
+    if _encoder is None:
+        from sentence_transformers import SentenceTransformer
+        _encoder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+    return _encoder
 
 
 def load_kb(modality: str, kb_root: str = None) -> List[dict]:
@@ -19,27 +30,54 @@ def load_kb(modality: str, kb_root: str = None) -> List[dict]:
     return entries
 
 
-def build_text_index(entries: List[dict]) -> list:
-    """Build text-based index (question embeddings placeholder)."""
-    # For now, just use questions as-is for fallback matching
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    questions = [e.get("question", "") for e in entries]
-    if not questions or not any(q.strip() for q in questions):
-        return []
-    vectorizer = TfidfVectorizer(max_features=500, stop_words="english")
-    tfidf_matrix = vectorizer.fit_transform(questions)
-    return [vectorizer, tfidf_matrix, questions, entries]
+def build_text_index(entries: List[dict], modality: str = "", kb_root: str = None) -> Tuple[np.ndarray, List[str], List[dict]]:
+    """Build semantic embedding index for retrieval, with file caching."""
+    if not entries:
+        return np.array([]), [], []
+    
+    # Check for cached embeddings
+    cache_dir = os.path.join(kb_root or os.path.join(os.path.dirname(__file__), "../../data/knowledge_bases"), modality)
+    cache_path = os.path.join(cache_dir, "embeddings.npy")
+    cache_texts_path = os.path.join(cache_dir, "texts.npy")
+    
+    if os.path.exists(cache_path) and os.path.exists(cache_texts_path):
+        embeddings = np.load(cache_path)
+        texts = np.load(cache_texts_path, allow_pickle=True).tolist()
+        return embeddings, texts, entries
+    
+    texts = []
+    for e in entries:
+        q = e.get("question", "").strip()
+        a = e.get("answer", "").strip()
+        texts.append(f"{q} {a}")
+    
+    encoder = _get_encoder()
+    embeddings = encoder.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+    
+    # Cache to disk
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        np.save(cache_path, embeddings)
+        np.save(cache_texts_path, np.array(texts, dtype=object))
+    except Exception as e:
+        print(f"[WARN] Could not cache embeddings: {e}")
+    
+    return embeddings, texts, entries
 
 
-def retrieve_text(query: str, text_index: list, top_k: int = 3, threshold: float = 0.1) -> List[dict]:
-    """Retrieve top-k similar entries by TF-IDF similarity."""
-    if not text_index:
+def retrieve_text(query: str, index_data: tuple, top_k: int = 3, threshold: float = 0.2) -> List[dict]:
+    """Retrieve top-k similar entries by sentence embedding similarity."""
+    embeddings, texts, entries = index_data
+    if len(embeddings) == 0:
         return []
-    vectorizer, tfidf_matrix, questions, entries = text_index
-    query_vec = vectorizer.transform([query])
+    
+    encoder = _get_encoder()
+    query_emb = encoder.encode([query], show_progress_bar=False, convert_to_numpy=True)
+    
     from sklearn.metrics.pairwise import cosine_similarity
-    scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
+    scores = cosine_similarity(query_emb, embeddings).flatten()
     top_indices = np.argsort(scores)[::-1]
+    
     results = []
     for idx in top_indices:
         if scores[idx] < threshold:
@@ -61,8 +99,8 @@ def retrieve_by_modality(query: str, modality: str, kb_root: str = None,
     entries = load_kb(modality, kb_root)
     if not entries:
         return []
-    text_index = build_text_index(entries)
-    return retrieve_text(query, text_index, top_k)
+    index_data = build_text_index(entries)
+    return retrieve_text(query, index_data, top_k)
 
 
 def kb_stats(kb_root: str = None) -> Dict[str, int]:
