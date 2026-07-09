@@ -55,13 +55,16 @@ class _CovAccumulator:
         # x: (N, dim) float
         x = x.detach().to(torch.float64).reshape(-1, self.dim)
         self._ensure_device(x)
-        for row in x:
-            self.n += 1
-            n = self.n
-            delta = row - self.mean
-            self.mean += delta / n
-            delta2 = row - self.mean
-            self.M2 += torch.outer(delta, delta2)
+        n_batch = x.shape[0]
+        # Welford batch update: vectorized via matrix multiply
+        # Instead of: for each row: delta = row-mean, M2 += outer(delta, delta2)
+        # Use: delta = x - mean_new, delta_old = x - mean_old, M2 += delta.T @ delta_old
+        mean_new = self.mean + (x - self.mean).sum(0) / (self.n + n_batch)
+        delta = x - mean_new        # (N, D)  new-centered
+        delta_old = x - self.mean   # (N, D)  old-centered
+        self.M2 += delta.T @ delta_old
+        self.mean = mean_new
+        self.n += n_batch
 
     def stats(self):
         if self.mean is None or self.n < 2:

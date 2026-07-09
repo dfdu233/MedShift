@@ -177,12 +177,18 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
             continue
         try:
             from PIL import Image
-            img = Image.open(img_path).convert("RGB")
-            # grounded: forward with correct answer as teacher-forcing target
+            import torch
+            dev = next(model.model.parameters()).device
+            # grounded: forward with correct answer to trigger decoder hooks
             captured.clear()
             msgs = {"prompt": f"Answer concisely: {q}\nAnswer: {a_correct}",
                     "image": img}
-            _ = model.process_messages(msgs)
+            inp = model.process_messages(msgs)
+            inp = {k: v.to(dev) if isinstance(v, torch.Tensor) else v
+                   for k, v in inp.items()}
+            with torch.no_grad():
+                model.model.generate(**inp, max_new_tokens=8, do_sample=False,
+                                     pad_token_id=model.tokenizer.eos_token_id)
             # capture last-token hidden per layer
             for ln in layer_names:
                 if ln in captured:
@@ -196,7 +202,12 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
             captured.clear()
             msgs = {"prompt": f"Answer concisely: {q}\nAnswer: {wrong}",
                     "image": img}
-            _ = model.process_messages(msgs)
+            inp = model.process_messages(msgs)
+            inp = {k: v.to(dev) if isinstance(v, torch.Tensor) else v
+                   for k, v in inp.items()}
+            with torch.no_grad():
+                model.model.generate(**inp, max_new_tokens=8, do_sample=False,
+                                     pad_token_id=model.tokenizer.eos_token_id)
             for ln in layer_names:
                 if ln in captured:
                     h = captured[ln]
