@@ -1,0 +1,567 @@
+% =====================================================================
+%  MedShift+ Algorithm Flow (LaTeX)
+%  Auto-generated from docs/METHODS_TECHNICAL_REPORT.md
+%  Compile:  pdflatex ALGORITHM_FLOW.tex   (twice, for hyperref refs)
+%  Required packages: algorithm, algpseudocode, amsmath, amssymb,
+%                     booktabs, geometry, hyperref
+% =====================================================================
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black,
+  pdftitle={MedShift+ Algorithm Flow},
+  pdfauthor={MedShift Team}
+}
+
+% Convenience macros
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\Given}{\textbf{Given }}
+\newcommand{\Input}{\textbf{Input: }}
+\newcommand{\Output}{\textbf{Output: }}
+\newcommand{\vbf}[1]{\mathbf{#1}}
+
+% Pretty failure-root-cause comment
+\newcommand{\failreason}[1]{\Comment{\textcolor{red!70!black}{#1}}}
+
+\title{MedShift+ Algorithm Flow\\[2pt]
+\large Complete \LaTeX{} Pseudocode for Phase 0--1 (v1) and Phase 2 v2 Methods}
+\author{MedShift Project}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document provides complete \LaTeX{} algorithm pseudocode for every method
+described in \texttt{METHODS\_TECHNICAL\_REPORT.md}. Part~\ref{part:v1} covers
+the Phase~0--1 methods that have been empirically shown to fail on Hulu-Med~14B
+(each block is a brief pseudocode annotated with its failure root cause, per the
+user's preference). Part~\ref{part:v2} covers the Phase~2~v2 methods
+(Whitening, MA-RAG, MEDA, Domain-Shift-Aware Conformal) as full algorithm
+blocks ready for paper inclusion. Each algorithm is self-contained and is
+preceded by its governing equation(s).
+\end{abstract}
+
+\tableofcontents
+
+% =====================================================================
+\part{Phase 0--1 Methods (v1, Failed)}
+\label{part:v1}
+% =====================================================================
+
+\section{AdaIN --- Adaptive Instance Normalization}\label{sec:adain}
+
+\paragraph{Governing equation.} For ViT LayerNorm output $f\in\R^{d}$
+($d{=}1152$) at layer $\ell$, with source statistics
+$(\mu_\ell^{\text{src}},\sigma_\ell^{\text{src}})$:
+\begin{equation}\label{eq:adain}
+f' \;=\; \frac{f-\mu_\ell^{\text{test}}}{\sigma_\ell^{\text{test}}}\,\sigma_\ell^{\text{src}}+\mu_\ell^{\text{src}} .
+\end{equation}
+
+\begin{algorithm}[H]
+\caption{AdaIN --- first-order feature alignment (FAILED, $-3.5\%$)}\label{alg:adain}
+\begin{algorithmic}[1]
+\Input Source image set $\mathcal{D}_{\text{src}}$, test image $x$, layer set $\mathcal{L}$ (default first $18/55$ LN layers)
+\Output Whitened feature stream fed to LLM decoder
+\State Precompute $\{(\mu_\ell^{\text{src}},\sigma_\ell^{\text{src}})\}_{\ell\in\mathcal{L}}$ via Welford online on $\mathcal{D}_{\text{src}}$
+\For{each forward call on $x$}
+  \For{each LN layer $\ell\in\mathcal{L}$}
+    \State register forward hook on $\ell$
+    \State $\mu_\ell^{\text{test}}\gets\mathrm{mean}(f),\;\;\sigma_\ell^{\text{test}}\gets\mathrm{std}(f)+\epsilon$
+    \State $f'\gets$ Eq.~\eqref{eq:adain}; \textbf{return} $f'$ \failreason{first-order only; disturbs semantic layers}
+  \EndFor
+\EndFor
+\Statex \failreason{Root cause: 1st-order stats $\neq$ domain; residual is anisotropic low-dim subspace (Ar=28.6)}
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------
+\section{VCD --- Visual Contrastive Decoding}\label{sec:vcd}
+
+\paragraph{Governing equation.} With clean image $v$ and noise image $v'$:
+\begin{equation}\label{eq:vcd}
+\ell_{\text{vcd}} \;=\; (1+\alpha)\,\ell(v,x) \;-\; \alpha\,\ell(v',x), \qquad \alpha\in[0.5,1.0].
+\end{equation}
+
+\begin{algorithm}[H]
+\caption{VCD --- logits linear contrast (FAILED, greedy $-7.5\%$, sampling $-13\%$)}\label{alg:vcd}
+\begin{algorithmic}[1]
+\Input image $v$, question $x$, contrast strength $\alpha$
+\State $v'\gets$ diffusion\_noise($v$, steps=500)
+\For{each generation step $t$}
+  \State $\ell\gets$ model.logits($v,x,\cdot\le t$)
+  \State $\ell'\gets$ model.logits($v',x,\cdot\le t$) \Comment{extra forward per step}
+  \State $\ell_{\text{vcd}}\gets$ Eq.~\eqref{eq:vcd}
+  \State next token $\gets\arg\max\ell_{\text{vcd}}$
+\EndFor
+\Statex \failreason{Root cause: linear affine transform preserves $\arg\max$ ordering}
+\Statex \failreason{$\Rightarrow$ cannot flip $\ell_{\text{wrong}}>\ell_{\text{correct}}$; greedy-locked on 14B}
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------
+\section{RAG-KI (Subtractive)}\label{sec:rag-ki}
+
+\paragraph{Governing equation.} With RAG-augmented input $x_{\text{rag}}$:
+\begin{equation}\label{eq:rag-sub}
+\ell_{\text{rag}} \;=\; (1+\beta)\,\ell(v,x) \;-\; \beta\,\ell(v,x_{\text{rag}}).
+\end{equation}
+
+\begin{algorithm}[H]
+\caption{RAG-KI subtractive contrast (FAILED, collapsed to 0)}\label{alg:rag-ki}
+\begin{algorithmic}[1]
+\Input image $v$, question $x$, KB $\mathcal{K}$, strength $\beta$
+\State retrieve top-$k$ KB entries by sentence-BERT($x$)
+\State build $x_{\text{rag}}\gets$ prompt$+$$+$evidence
+\State $\ell_{\text{rag}}\gets$ Eq.~\eqref{eq:rag-sub}
+\State decode $\arg\max\ell_{\text{rag}}$
+\Statex \failreason{Direction reversed: subtracts the BETTER reference (knowledge penalized)}
+\Statex \failreason{Also: \texttt{\_\_init\_\_} returned a tuple (code bug)}
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------
+\section{RAG (Additive Entity-Boost)}\label{sec:rag-boost}
+
+\paragraph{Governing equation.} Token-level additive boost on retrieved answer tokens:
+\begin{equation}\label{eq:rag-boost}
+\text{scores}[:,t_{\text{id}}] \;+\!\!=\; w_{\text{boost}}, \qquad t_{\text{id}}\in\mathrm{tokens}(\text{retrieved answer}).
+\end{equation}
+
+\begin{algorithm}[H]
+\caption{RAG additive entity-boost (FAILED, $-5.5\%$ to $-8\%$)}\label{alg:rag-boost}
+\begin{algorithmic}[1]
+\Input image $v$, question $x$, KB $\mathcal{K}$, boost weight $w_{\text{boost}}\in\{1.5,2.0\}$
+\State $q_{\text{emb}}\gets$ sentence-BERT($x$)
+\State retrieve top-5 KB entries by cosine($q_{\text{emb}}$, KB embeddings)
+\State collect entity token ids $\mathcal{T}\gets\bigcup_i\mathrm{tokens}(a_i)$
+\For{each generation step}
+  \State scores $\gets$ model.logits($\cdot$)
+  \State scores$[:,\mathcal{T}]\;\mathrel{+}=\;w_{\text{boost}}$ \Comment{Eq.~\eqref{eq:rag-boost}}
+  \State next token $\gets\arg\max$scores
+\EndFor
+\Statex \failreason{Token-grain mismatch: "Spinal Cord"$\to$[10145,18463] but answer must be Yes/No or A/B/C/D}
+\Statex \failreason{Text-only retrieval is image-blind; top-5 only 42\% correct, $\sim$35\% contradictory}
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------
+\section{Cache-based TTA}\label{sec:cache-tta}
+
+\paragraph{Governing equation.} Logits interpolation with a cache distribution:
+\begin{equation}\label{eq:cache-tta}
+\ell' \;=\; (1-\lambda)\,\ell \;+\; \lambda\,\ell_{\text{cache}}, \qquad
+\ell_{\text{cache}} \;=\; \sum_i \mathrm{sim}_i\,\mathrm{onehot}(\text{tokens}(a_i)) \;-\; \mathrm{mean}(\cdot).
+\end{equation}
+
+\begin{algorithm}[H]
+\caption{Cache-based TTA logits calibration (FAILED, $-0.2\%$ full-set; 200-subset false positive)}\label{alg:cache-tta}
+\begin{algorithmic}[1]
+\Input image $v$, question $x$, cache $\mathcal{C}=\{$embeddings, entries$\}$, $\lambda$, top-$k$
+\State retrieve top-$k$ entries from $\mathcal{C}$ by sentence-BERT($x$)
+\State $\ell_{\text{cache}}\gets\sum_i\mathrm{sim}_i\,\mathrm{onehot}(\mathrm{tokens}(a_i))$
+\State $\ell_{\text{cache}}\gets\ell_{\text{cache}}/n - \mathrm{mean}(\ell_{\text{cache}})$
+\For{each generation step}
+  \State $\ell\gets$ model.logits($\cdot$)
+  \State $\ell'\gets$ Eq.~\eqref{eq:cache-tta}
+  \State next token $\gets\arg\max\ell'$
+\EndFor
+\Statex \failreason{No single $\lambda$ both strong enough ($>0.3$ to flip) and weak enough ($<0.1$ to stay clean)}
+\Statex \failreason{200-sample $+0.5\%\approx$1 lucky flip $\Rightarrow$ must validate on full 2000}
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------
+\section{Cross-method Failure Modes (v1)}\label{sec:cross-fail}
+
+\begin{table}[H]
+\centering\small
+\caption{Shared failure modes of Phase 0--1 methods.}
+\label{tab:cross-fail}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Mode & Description \\
+\midrule
+Greedy lock & 14B logits gap $>4$; any linear logits intervention cannot flip $\arg\max$ \\
+2nd-order stacking & feature$+$logits$+$contrast stacking always degrades \\
+Medical specificity & object-hallucination remedies (DoLa/VCD) $\neq$ medical mis-read$+$knowledge-gap \\
+200-sample false positive & 200 samples $\pm0.5\%$ within 95\% CI $\Rightarrow$ full-set required \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\part{Phase 2 v2 Methods (Proposed)}
+\label{part:v2}
+% =====================================================================
+
+% ---------------------------------------------------------------------
+\section{Line 1: Feature Higher-Order Whitening}\label{sec:whitening}
+
+\paragraph{Theoretical basis.}
+\begin{itemize}
+\item \emph{Anisotropic Modality Align} (arXiv 2605.07825, May 2026): cross-modal residual after first-order alignment is an \emph{anisotropic low-dimensional subspace} (anisotropy ratio $\mathrm{Ar}{=}28.6$, effective dim $d_{\text{eff}}/d{=}0.284$); first-order alignment cancels only a small fraction.
+\item \emph{Feature-Whitening} (Roy, CVPR 2019): layer-specific covariance whitening aligns distributions without a dedicated loss.
+\end{itemize}
+
+\paragraph{Governing equation.} For source covariance $\Sigma_\ell^{\text{src}}\in\R^{d\times d}$ with eigendecomposition $\Sigma=V\Lambda V^{\!\top}$, truncated to top-$r$ principal subspace:
+\begin{equation}\label{eq:whiten}
+f' \;=\; \mu_\ell^{\text{src}} \;+\; W_\ell\,(f-\mu_\ell^{\text{src}}), \qquad
+W_\ell \;=\; V_{\text{top-}r}\,\operatorname{diag}\!\bigl(1/\sqrt{\lambda_{\text{top-}r}+\rho}\bigr)\,V_{\text{top-}r}^{\!\top},
+\end{equation}
+where $\rho$ is a ridge for ill-conditioned spectra. Optional MMD gating skips shallow-shift layers:
+\begin{equation}\label{eq:mmd-gate}
+\text{shift\_score}_\ell \;=\; \norm[\big]{\bar f_\ell^{\text{test}}-\mu_\ell^{\text{src}}}_{\Sigma^{-1}} \;\gtrless\; \tau \;\Rightarrow\; \text{whiten} \,/\, \text{skip}.
+\end{equation}
+
+\paragraph{Design parameters.}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Parameter & Default & Meaning \\
+\midrule
+\texttt{top\_r} & 32 & principal subspace dim ($1152\to32$, $\sim95\%$ spectral energy) \\
+\texttt{ridge} $\rho$ & $1\mathrm{e}{-3}$ & eigenvalue regularization \\
+\texttt{gate\_threshold} $\tau$ & $0.0$ & MMD gate ($0{=}$always whiten; $>0{=}$only high-shift layers) \\
+\texttt{num\_shallow} & 9 & number of shallow layers to align (deep 18 carry semantics) \\
+\texttt{stat\_samples} & 500 & source statistics image count \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{algorithm}[H]
+\caption{Feature Higher-Order Whitening with MMD Gating}\label{alg:whitening}
+\begin{algorithmic}[1]
+\Input source image set $\mathcal{D}_{\text{src}}$ ($|\mathcal{D}_{\text{src}}|=500$), test image $x$; hyperparams $r,\rho,\tau,n_{\text{shallow}}$
+\Output feature stream aligned to source covariance subspace
+\Statex \Comment{\textbf{Phase A --- offline source statistics (once)}}
+\State $n\gets0$;\; initialize Welford accumulators $\{\mathrm{count}_\ell,\,\bar f_\ell,\,M_{2,\ell}\}_{\ell=1}^{n_{\text{shallow}}}$
+\For{each image $x_s\in\mathcal{D}_{\text{src}}$}
+  \State run ViT forward with collection hooks on first $n_{\text{shallow}}$ LN layers
+  \For{each LN layer $\ell\le n_{\text{shallow}}$}
+    \State $f_\ell\gets$ LN output reshaped to $(B\cdot N, d)$
+    \State vectorized Welford batch update:
+      \Statex \quad $n'\gets n+\!|f_\ell|,\;\;\delta\gets\bar f_\ell,\;\;\bar f_\ell\mathrel{+}\!=\delta\cdot\mathrm{count}'$,\; $M_{2,\ell}\mathrel{+}\!=\sum(f_\ell-\bar f_\ell)(f_\ell-\bar f_\ell')$
+  \EndFor
+\EndFor
+\For{each LN layer $\ell\le n_{\text{shallow}}$}
+  \State $\mu_\ell^{\text{src}}\gets\bar f_\ell$
+  \State $\Sigma_\ell^{\text{src}}\gets M_{2,\ell}/(\mathrm{count}_\ell-1)$
+  \State eigendecompose $\Sigma_\ell^{\text{src}}=V\Lambda V^{\!\top}$
+  \State $W_\ell\gets V_{\text{top-}r}\,\operatorname{diag}(1/\sqrt{\lambda_{\text{top-}r}+\rho})\,V_{\text{top-}r}^{\!\top}$ \Comment{Eq.~\eqref{eq:whiten}}
+  \State cache $(\mu_\ell^{\text{src}},W_\ell)$
+\EndFor
+\Statex \Comment{\textbf{Phase B --- inference-time whitening hook}}
+\State register \textsc{WhiteningHook} on first $n_{\text{shallow}}$ LN layers
+\For{each test image $x$}
+  \State run ViT forward
+  \For{each hooked LN layer $\ell$}
+    \State $f\gets$ LN output
+    \If{$\tau>0$}
+      \State compute $\text{shift\_score}_\ell$ via Eq.~\eqref{eq:mmd-gate}
+      \If{$\text{shift\_score}_\ell<\tau$} \textbf{skip whitening}; \textbf{continue} \EndIf
+    \EndIf
+    \State $f'\gets\mu_\ell^{\text{src}}+W_\ell(f-\mu_\ell^{\text{src}})$
+    \State return $f'$ to forward path (cast to original dtype)
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Known issue.}
+\texttt{apply\_whitening\_to\_shallow\_layers} currently reads
+\texttt{model.model.model.vision\_encoder}; the actual Hulu-Med structure is
+\texttt{model.model.vision\_encoder} under \texttt{HulumedQwen3ForCausalLM}. Must
+be confirmed after model loading and unified.
+
+\paragraph{v1 $\to$ v2 contrast.}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & AdaIN (v1) & Whitening (v2) \\
+\midrule
+Statistic order & 1st (mean, std) & 2nd (covariance, eigen) \\
+Alignment & per-element scale & full covariance whitening + subspace truncation \\
+Semantic protection & reduce layers ($18/55$) & shallow-only + MMD adaptive gate \\
+Theory gap & 1st-order $\neq$ domain & aligns along anisotropic residual principal dirs \\
+Estimation & Welford online (fixed) & Welford batch cov (vectorized) \\
+Expected gain & $-3.5\%$ to $-7\%$ (all negative) & target $+1$--$3\%$ (TBD) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------
+\section{Line 2: MA-RAG + BiomedCLIP Multi-Round Conflict-Consensus RAG}\label{sec:ma-rag}
+
+\paragraph{Theoretical basis.}
+\begin{itemize}
+\item \emph{MA-RAG} (ICML 2026 poster): ``From Conflict to Consensus'' --- multi-round agentic RAG, semantic conflict drives new retrieval, eventual consensus.
+\item \emph{MMed-RAG} (ICLR 2025): domain-aware retrieval + RAG-based preference tuning.
+\item \emph{Binary Retrieval-Augmented Reward} (ICML 2026): binary discriminator scores candidates.
+\end{itemize}
+
+\paragraph{Architecture.}
+Test image + question $\to$ [Round 0] VLM samples $N$ candidates ($T{=}0.7$)
+$\to$ [Conflict Detect] semantic conflict (normalized exact match + embedding distance)
+$\to$ [if conflict] Disambiguation Query $\to$ BiomedCLIP retrieval $\to$ evidence injected into prompt $\to$ VLM regenerates; iterate up to $M$ rounds or resolved
+$\to$ [Consensus] majority vote (optionally augmented by binary BERT verifier reranker).
+
+\paragraph{Design parameters.}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Parameter & Default & Meaning \\
+\midrule
+\texttt{n\_candidates} $N$ & 3 & candidates per round \\
+\texttt{max\_rounds} $M$ & 2 & max iteration rounds \\
+\texttt{top\_k} & 5 & KB entries retrieved per query \\
+\texttt{text\_weight} & 0.3 & retrieval text-embedding weight ($1{-}w{=}$image weight) \\
+\texttt{dedup\_contradictions} & True & keep only first entry per (Q, conflicting A) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{algorithm}[H]
+\caption{MA-RAG Multi-Round Conflict-Consensus Pipeline}\label{alg:ma-rag}
+\begin{algorithmic}[1]
+\Input test image $v$, question $x$, KB $\mathcal{K}$, BiomedCLIP retriever $\mathcal{R}_{\text{CLIP}}$, VLM $\mathcal{M}$; hyperparams $N,M,k,w_{\text{txt}}$
+\Output consensus answer $\hat a$
+\Statex \Comment{\textbf{Offline --- build BiomedCLIP index (once)}}
+\State for each KB entry $(q_i,a_i,\text{img}_i)$: compute
+  $\mathbf{e}_i \gets w_{\text{txt}}\,\mathrm{CLIP}_{\text{txt}}(q_i)+(1{-}w_{\text{txt}})\,\mathrm{CLIP}_{\text{img}}(\text{img}_i)$
+\State store index $\{(\mathbf{e}_i,q_i,a_i)\}$; dedup contradictions: per normalized $q$ keep first $a$
+\Statex \Comment{\textbf{Online --- candidate generation \& conflict loop}}
+\State $\mathcal{C}\gets\mathcal{M}.\text{sample}(v,x,N,T{=}0.7)$ \Comment{Round 0}
+\For{round $m=1$ \textbf{to} $M$}
+  \State normalize candidates: $\tilde{\mathcal{C}}\gets\{\mathrm{norm}(c):c\in\mathcal{C}\}$
+  \State \textbf{detect conflict}: $\mathrm{conflict}\gets$ ($|\mathrm{unique}(\tilde{\mathcal{C}})|>1$)
+    \Comment{upgrade: $+$ embedding cosine $<\theta$}
+  \If{not $\mathrm{conflict}$} \textbf{break} \EndIf
+  \State build disambiguation query $q^*\gets$ \textsc{BuildDisambiguationQuery}$(\tilde{\mathcal{C}},x)$
+  \State $\mathbf{q}_{\text{emb}}\gets w_{\text{txt}}\,\mathrm{CLIP}_{\text{txt}}(q^*)+(1{-}w_{\text{txt}})\,\mathrm{CLIP}_{\text{img}}(v)$
+  \State retrieve $\mathcal{E}\gets\text{top-}k\bigl(\mathcal{K},\,\mathbf{q}_{\text{emb}}\bigr)$
+  \State inject $\mathcal{E}$ into prompt: $x'\gets x\;+\!\!$\;evidence$\mathcal{E}$
+  \State $\mathcal{C}\gets\mathcal{M}.\text{sample}(v,x',N,T{=}0.7)$ \Comment{regenerate}
+\EndFor
+\State $\hat a\gets\mathrm{majority\_vote}(\tilde{\mathcal{C}})$
+\State \Comment{optional augmentation: binary verifier reranker (Sec.~\ref{sec:ma-rag-enh})}
+\State \Return $\hat a$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Enhancement plan.}\label{sec:ma-rag-enh}
+\begin{enumerate}
+\item \textbf{Conflict detection upgrade:} normalized exact match $\to$ embedding cosine distance threshold (reuse cached \texttt{all-MiniLM-L6-v2}).
+\item \textbf{Evidence phrase extraction (borrowing LGDEA):} use a local small LLM to extract medical evidence phrases (e.g.\ ``right lower lobe consolidation'') from KB answers, for finer retrieval.
+\item \textbf{Binary verifier reranker:} train a small BERT classifier (on KB pairs + MedHEval train, \emph{not} the VLM) scoring candidate--evidence consistency, used for reranking.
+\end{enumerate}
+
+\paragraph{v1 $\to$ v2 contrast.}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & Old RAG (v1) & MA-RAG (v2) \\
+\midrule
+Retrieval feature & text-only (sentence-BERT) & BiomedCLIP image+text (weighted) \\
+KB contradiction & boosts cancel (negative) & conflict $\to$ new retrieval signal (positive) \\
+Answer generation & token-level boost (grain mismatch) & prompt-level injection (model generates) \\
+Multi-round & single round & $N$ candidates $\to$ conflict $\to$ iterate $\to$ consensus \\
+Candidate reranking & none & majority vote (+ binary verifier) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------
+\section{Line 3: MEDA Medical Activation Editing}\label{sec:meda}
+
+\paragraph{Theoretical basis.}
+\begin{itemize}
+\item \emph{MEDA} (ICML 2026 poster): ``Medical-Oriented Activation Editing'' --- QMS steers activation by query semantics + modal steering vector; edits activation at inference, no parameter update.
+\item \emph{PAI} (ECCV 2024): amplify image-token attention weights on hidden states (not logits) $\Rightarrow$ bypasses the greedy lock.
+\end{itemize}
+
+\paragraph{Governing equation.} In the decoder residual stream at layer $\ell$:
+\begin{equation}\label{eq:meda}
+\mathbf{h}' \;=\; \mathbf{h} \;+\; \alpha\,\langle\mathbf{h},\mathbf{g}_\ell\rangle\,\mathbf{g}_\ell \;-\; \beta\,\langle\mathbf{h},\mathbf{u}_\ell\rangle\,\mathbf{u}_\ell,
+\end{equation}
+where (normalized) directions are contrastive activations:
+\begin{equation}\label{eq:meda-dirs}
+\mathbf{g}_\ell \;=\; \frac{\E[\mathbf{h}_\ell\mid\text{correct}]-\E[\mathbf{h}_\ell\mid\text{wrong}]}{\norm[\big]{\cdot}}, \qquad
+\mathbf{u}_\ell \;=\; \frac{\E[\mathbf{h}_\ell\mid\text{wrong}]-\E[\mathbf{h}_\ell\mid\text{correct}]}{\norm[\big]{\cdot}}.
+\end{equation}
+Direction construction per KB QA pair: two forward passes ---
+\textbf{grounded} (image+correct question$\to$correct answer) and
+\textbf{hallucinated} (image+correct question$\to$wrong answer); VLM is frozen, activations read via hooks only.
+
+\begin{algorithm}[H]
+\caption{MEDA Medical Activation Editing (with QMS Router placeholder)}\label{alg:meda}
+\begin{algorithmic}[1]
+\Input frozen VLM $\mathcal{M}$, KB $\mathcal{K}=\{(v_i,q_i,a_i^+,a_i^-)\}$, decoder layer range $\mathcal{L}_{\text{edit}}\subset[40\%,80\%]$, strengths $\alpha,\beta$
+\Output edited answer for test query
+\Statex \Comment{\textbf{Phase A --- offline steering vector construction (once)}}
+\State init \textsc{SteeringVector} container: $\{(\mathbf{g}_\ell,\mathbf{u}_\ell)\}_{\ell\in\mathcal{L}_{\text{edit}}}$
+\For{each KB pair $(v_i,q_i,a_i^+,a_i^-)$}
+  \State $a_i^-\gets$ \textsc{MakeWrongAnswer}$(a_i^+)$ \Comment{OE: random different KB answer}
+  \State register collection hooks on $\mathcal{L}_{\text{edit}}$
+  \State $\mathbf{H}^{+}\gets\mathcal{M}.\text{forward}(v_i,q_i\!\to\!a_i^+)$ activations
+  \State $\mathbf{H}^{-}\gets\mathcal{M}.\text{forward}(v_i,q_i\!\to\!a_i^-)$ activations
+  \For{each layer $\ell\in\mathcal{L}_{\text{edit}}$}
+    \State accumulate $\mathbf{h}_\ell^{+}\gets$ last-token activation; likewise $\mathbf{h}_\ell^{-}$
+  \EndFor
+\EndFor
+\For{each layer $\ell\in\mathcal{L}_{\text{edit}}$}
+  \State $\mathbf{g}_\ell\gets$ Eq.~\eqref{eq:meda-dirs} (mean-over-pairs, normalize)
+  \State $\mathbf{u}_\ell\gets$ Eq.~\eqref{eq:meda-dirs} (mean-over-pairs, normalize)
+\EndFor
+\Statex \Comment{\textbf{Phase B --- QMS Router (planned, single-direction fallback for now)}}
+\State \textbf{if} QMS enabled: entities $\gets\mathrm{NER}(q_{\text{test}})$; select per-entity $(\mathbf{g}_\ell,\mathbf{u}_\ell)$
+\State \textbf{else}: use global $(\mathbf{g}_\ell,\mathbf{u}_\ell)$ for all queries
+\Statex \Comment{\textbf{Phase C --- inference-time activation editing hook}}
+\State register \textsc{MEDAHook} on $\mathcal{L}_{\text{edit}}$
+\For{each generation step}
+  \State run decoder forward
+  \For{each hooked layer $\ell$}
+    \State $\mathbf{h}\gets$ residual stream output
+    \State $\mathbf{h}'\gets$ Eq.~\eqref{eq:meda} \Comment{edit residual, non-linear $\Rightarrow$ bypasses greedy lock}
+    \State return $\mathbf{h}'$ to forward path
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{QMS Router enhancement (planned).}
+Current steering vector is a single per-layer direction. MEDA's QMS requires per-query dynamic routing: extract medical entities from the user query (e.g.\ ``Is there a pneumothorax?'' $\to$ \texttt{[pneumothorax]}) and select the corresponding steering direction. Requires building one steering vector per medical concept and an NER router; raises the KB requirement (per-concept-grouped QA pairs).
+\begin{equation*}
+\text{Query}\;\xrightarrow{\text{NER}}\;\text{entities}\;\to\;\text{concept-specific }(\mathbf{g}_\ell^{(c)},\mathbf{u}_\ell^{(c)}).
+\end{equation*}
+
+\paragraph{v1 $\to$ v2 contrast.}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & VCD (v1) & MEDA (v2) \\
+\midrule
+Operation space & logits (linear) & hidden states (non-linear) \\
+Bypass greedy lock & $\times$ (linear transform preserves order) & \checkmark (edits residual) \\
+Medical prior & none & QMS query-directional + modal steering vector \\
+Construction & noise image & contrastive activation from KB \\
+Compute & $2\times$ forward / step & offline steering build (once) $+$ inference hook \\
+Reported effect & $-6\%$ to $-13\%$ (this project) & $\sim$10\% factuality gain (IU-Xray, MEDA) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------
+\section{Cross-Cutting: Domain-Shift-Aware Conformal Safety Layer}\label{sec:conformal}
+
+\paragraph{Theoretical basis.}
+\begin{itemize}
+\item \emph{Domain-Shift-Aware Conformal Prediction} (ICML 2026 poster): when target domain shifts from the calibration set, reweight calibration samples and raise the threshold (more conservative abstention).
+\item \emph{CAP} (PMLR 2026): Conformalized Abstention Policies.
+\item \emph{HAC} (arXiv 2604.02543): Hallucination-Aware Calibration.
+\end{itemize}
+
+\paragraph{Bug fixes applied} to original \texttt{conformal\_safety.py}:
+\begin{enumerate}
+\item \textbf{Threshold override bug (lines 92--102):} coverage-search threshold was overwritten by the conformal quantile $\Rightarrow$ search result discarded. Fixed: take $\max(\text{search},\,\text{quantile})$ (stricter threshold).
+\item \textbf{Single-token match fragility (line 181):} \texttt{tokenizer.decode(next\_token)} substring match is unreliable. Fixed: generate a complete short answer $+$ reuse the judge function.
+\item \textbf{No domain awareness:} added \texttt{set\_domain\_distance()}; on detected shift, automatically raise the threshold (lean toward abstain).
+\end{enumerate}
+
+\paragraph{Confidence score.} For logits $\ell$, with $p=\mathrm{softmax}(\ell)$ and top-2 $(p_1,p_2)$:
+\begin{equation}\label{eq:conf}
+\mathrm{score}(\ell) \in \Bigl\{\,p_1,\; p_1-p_2,\; -\textstyle\sum_k p_k\log p_k,\; \ell_1-\ell_2\,\Bigr\}.
+\end{equation}
+
+\paragraph{Domain-shift reweighting.} Let $d_i$ be the domain distance of calibration sample $i$ and $d^*$ that of the test sample; samples farther from the test domain receive lower weight:
+\begin{equation}\label{eq:reweight}
+w_i \;=\; \frac{\exp(-(d_i-d^*)^2/\sigma_d^2)}{\sum_j \exp(-(d_j-d^*)^2/\sigma_d^2)}, \qquad
+\hat F_{\text{shift}}(s) \;=\; \sum_i w_i\,\mathbf{1}[s_i\le s].
+\end{equation}
+Threshold $\hat T$ is the $\lceil(1-\alpha)(n+1)\rceil$-th order statistic of $\hat F_{\text{shift}}$; when $d^*$ is large the effective sample size drops $\Rightarrow$ $\hat T$ rises $\Rightarrow$ more abstention.
+
+\begin{algorithm}[H]
+\caption{Domain-Shift-Aware Conformal Safety Layer}\label{alg:conformal}
+\begin{algorithmic}[1]
+\Input calibration set $\{(\ell_i,y_i)\}_{i=1}^n$, confidence fn $\phi$ (default \texttt{margin}), target coverage $1-\alpha$ (default $0.90$), test logits $\ell^*$, optional domain distances $\{d_i\},d^*$
+\Output decision dict $\{\text{abstain},\text{score},\text{threshold},\dots\}$
+\Statex \Comment{\textbf{Phase A --- calibration (once)}}
+\For{$i=1$ \textbf{to} $n$}
+  \State $s_i\gets\phi(\ell_i)$; \quad $c_i\gets\mathbf{1}[\mathrm{judge}(\mathrm{decode}(\ell_i),y_i)=\text{correct}]$
+\EndFor
+\State $\mathcal{S}\gets\{s_i:c_i=\text{correct}\}$ \Comment{non-conformity scores on correct calib}
+\State $T_{\text{cov}}\gets$ coverage-search on $\mathcal{S}$ s.t.\ $P(\text{correct}\mid s\ge T)\ge 1{-}\alpha$
+\If{domain distances provided}
+  \State $w_i\gets$ Eq.~\eqref{eq:reweight}; \quad
+  $\hat F_{\text{shift}}\gets\sum_i w_i\,\mathbf{1}[s_i\le\cdot]$
+  \State $T_{\text{conf}}\gets$ $\lceil(1-\alpha)(n+1)\rceil$-th quantile of $\hat F_{\text{shift}}$
+  \State $T\gets\max(T_{\text{cov}},T_{\text{conf}})$ \Comment{fix bug 1: stricter threshold}
+\Else
+  \State $T\gets T_{\text{cov}}$
+\EndIf
+\Statex \Comment{\textbf{Phase B --- test-time decision}}
+\State generate full short answer $\hat y\gets\mathrm{decode}(\ell^*)$ \Comment{fix bug 2: not single token}
+\State $s^*\gets\phi(\ell^*)$
+\If{$s^*\ge T$} \textbf{answer} $\hat y$ \textbf{(commit)} \Else{} \textbf{abstain} \EndIf
+\State \Return $\{\text{abstain}\gets s^*<T,\;\text{score}\gets s^*,\;\text{threshold}\gets T,\;\text{answer}\gets\hat y\}$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Interface.}
+\begin{verbatim}
+safety = ConformalSafetyLayer(confidence_fn="margin", target_coverage=0.90)
+safety.calibrate(calibration_logits, calibration_correct)
+safety.set_domain_distance(mmd_distance)   # e.g. from WhiteningHook._shift_score
+decision = safety.decide(test_logits)
+# {"abstain": True/False, "score": 0.8, "threshold": 1.2, ...}
+\end{verbatim}
+
+% =====================================================================
+\part{Summary}
+% =====================================================================
+
+\section{ICML 2026 Paper $\to$ Component Mapping}\label{sec:mapping}
+
+\begin{table}[H]\centering\small
+\caption{Mapping of ICML 2026 papers to MedShift components.}
+\label{tab:mapping}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ICML 2026 paper & MedShift component & Status \\
+\midrule
+MEDA (poster 63562) & Line 3: medical activation editing & \checkmark impl., fix path + QMS pending \\
+MA-RAG (poster 63972) & Line 2: multi-round conflict-consensus RAG & \checkmark impl., conflict detect to enhance \\
+BiomedCLIP-PubMedBERT (HF) & Line 2: retrieval encoder & $\triangle$ downloading, code ready \\
+LGDEA (poster 65736) & Line 2: evidence phrase extraction & $\square$ planned (small auxiliary) \\
+Binary RAR (poster 65671) & Line 2: binary verifier rerank & $\square$ planned (small auxiliary) \\
+Domain-Shift-Aware Conformal (63691) & cross-cutting safety layer & \checkmark fixed + upgraded \\
+Anisotropic Modality Align (arXiv) & Line 1 theoretical basis & \checkmark implemented \\
+See-Act-Adapt (poster 65692) & Line 1 MMD gate & \checkmark built-in \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Orthogonal Ablation Discipline}\label{sec:ablation}
+
+\begin{itemize}
+\item \textbf{Full-set validation only:} CXR-VisHal (2,017), MM-VisHal (3,530), FineGrained (5,547), KnowledgeDeficiencyOE (2,318). 200-sample subsets are sanity-check only.
+\item \textbf{Statistical significance:} paired bootstrap 95\% CI ($B{=}2000$); $\Delta$ valid only if outside CI.
+\item \textbf{Orthogonal ablation:} single line $\to$ pairwise (3 combos) $\to$ all-three $\to$ all-three$+$conformal; verify no 2nd-order stacking degradation.
+\item \textbf{Per-subtask split:} binary / MC / OE reported separately (token mismatch affects binary+MC only; OE root cause differs).
+\item \textbf{Per-sample statistics:} record helped / hurt / unchanged; track net gain.
+\end{itemize}
+
+\end{document}

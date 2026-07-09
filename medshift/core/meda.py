@@ -178,6 +178,7 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
         try:
             from PIL import Image
             import torch
+            img = Image.open(img_path).convert("RGB")
             dev = next(model.model.parameters()).device
             # grounded: forward with correct answer to trigger decoder hooks
             captured.clear()
