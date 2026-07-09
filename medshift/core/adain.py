@@ -185,13 +185,32 @@ def save_source_stats(stats: Dict, kb_root: str, modality: str):
 
 
 def apply_adain_to_model(model, source_stats: AdaINStats):
-    """Register AdaIN hooks on the model's vision encoder."""
+    """Register AdaIN hooks on ALL encoder layers (use for ablation)."""
+    return apply_adain_to_first_n_layers(model, source_stats, ratio=1.0)
+
+
+def apply_adain_to_first_n_layers(model, source_stats: AdaINStats, ratio: float = 0.33):
+    """
+    Register AdaIN hooks only on the first `ratio` fraction of encoder layers.
+    Later layers carry semantic info — applying AdaIN there hurts accuracy.
+    """
     ve = model.model.model.vision_encoder
-    hooks = []
+    all_ln_names = []
     for name, mod in ve.named_modules():
         if isinstance(mod, torch.nn.LayerNorm) or 'layer_norm' in name:
             if name in source_stats.means:
-                hook = AdaINHook(source_stats.means[name], source_stats.stds[name])
-                hooks.append(mod.register_forward_hook(hook))
-                print(f"[AdaIN] Hook registered on {name}")
+                all_ln_names.append(name)
+    
+    all_ln_names.sort()
+    n_target = max(1, int(len(all_ln_names) * ratio))
+    target_names = set(all_ln_names[:n_target])
+    
+    hooks = []
+    for name in all_ln_names:
+        if name in target_names:
+            hook = AdaINHook(source_stats.means[name], source_stats.stds[name])
+            mod = dict(ve.named_modules())[name]
+            hooks.append(mod.register_forward_hook(hook))
+    
+    print(f"[AdaIN] Applied to {len(hooks)}/{len(all_ln_names)} layers (ratio={ratio})")
     return hooks
