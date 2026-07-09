@@ -154,6 +154,10 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
     ground_acts: Dict[str, List[torch.Tensor]] = {ln: [] for ln in layer_names}
     halluc_acts: Dict[str, List[torch.Tensor]] = {ln: [] for ln in layer_names}
 
+    # Collect all KB answers for OE negative sampling (expand usable samples)
+    all_kb_answers = [e.get("answer", "").strip().lower() for e in entries[:num_samples]
+                      if e.get("answer", "").strip()]
+
     processed = 0
     for entry in entries[:num_samples]:
         img_name = entry.get("img_name", "")
@@ -186,8 +190,7 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
                     ground_acts[ln].append(h[0, -1, :].cpu())
 
             # hallucinated: forward with a deliberately wrong answer
-            # pick a wrong answer by negating binary or swapping MC letter
-            wrong = _make_wrong_answer(a_correct)
+            wrong = _make_wrong_answer(a_correct, kb_answers=all_kb_answers)
             if wrong is None:
                 continue
             captured.clear()
@@ -229,16 +232,23 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
     return SteeringVector(ground_dir, halluc_dir)
 
 
-def _make_wrong_answer(correct: str) -> Optional[str]:
-    """Construct a wrong answer for contrastive activation collection."""
+def _make_wrong_answer(correct: str, kb_answers: Optional[list] = None) -> Optional[str]:
+    """Construct a wrong answer for contrastive activation collection.
+
+    For OE questions, samples a random different answer from kb_answers
+    as a negative anchor (prevents discarding ~30% of KB entries)."""
     c = correct.strip().lower()
     if c in ("yes", "no"):
         return "no" if c == "yes" else "yes"
     if len(c) == 1 and c in "abcd":
-        # MC: rotate to a different letter
-        return {"a": "b", "b": "a", "c": "d", "d": "c"}[c]
-    # OE: prepend a negation / mismatched organ as a weak hallucination
-    return None  # skip for OE (cannot reliably fabricate a hallucination)
+        return {"a": "b", "b": "a", "c": "d", "d": "c"}.get(c, None)
+    # OE: use a random different answer from KB as rough negative
+    if kb_answers:
+        import random
+        others = [a for a in kb_answers if a.strip().lower() != c and len(a.strip()) > 0]
+        if others:
+            return random.choice(others)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -317,3 +327,8 @@ def apply_meda(model, steering: SteeringVector, alpha: float = 1.0,
     print(f"[MEDA] Applied to {applied}/{n} decoder layers "
           f"(range {s}:{e}, alpha={alpha}, beta={beta})")
     return hooks
+
+
+def remove_hooks(hooks: list):
+    for h in hooks:
+        h.remove()

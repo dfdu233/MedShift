@@ -41,13 +41,20 @@ class _CovAccumulator:
     def __init__(self, dim: int):
         self.dim = dim
         self.n = 0
-        self.mean = torch.zeros(dim, dtype=torch.float64)
-        # co-moment matrix M2 = sum (x-mean_old)(x-mean_new)^T  (Welford)
-        self.M2 = torch.zeros(dim, dim, dtype=torch.float64)
+        self.mean = None
+        self.M2 = None
+        self._device = None
+
+    def _ensure_device(self, x: torch.Tensor):
+        if self._device is None:
+            self._device = x.device
+            self.mean = torch.zeros(self.dim, dtype=torch.float64, device=self._device)
+            self.M2 = torch.zeros(self.dim, self.dim, dtype=torch.float64, device=self._device)
 
     def update(self, x: torch.Tensor):
         # x: (N, dim) float
         x = x.detach().to(torch.float64).reshape(-1, self.dim)
+        self._ensure_device(x)
         for row in x:
             self.n += 1
             n = self.n
@@ -56,14 +63,13 @@ class _CovAccumulator:
             delta2 = row - self.mean
             self.M2 += torch.outer(delta, delta2)
 
-    def stats(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.n < 2:
-            return self.mean.float(), torch.eye(self.dim) * 1e-6, torch.zeros(self.dim)
+    def stats(self):
+        if self.mean is None or self.n < 2:
+            return self.mean, None, None, None
         cov = self.M2 / (self.n - 1)  # unbiased
         eigvals, eigvecs = torch.linalg.eigh(cov)  # ascending
-        # clamp tiny/negative eigenvalues
         eigvals = eigvals.clamp_min(1e-8)
-        return self.mean.float(), cov.float(), eigvals.float(), eigvecs.float()
+        return self.mean.float().cpu(), cov.float().cpu(), eigvals.float().cpu(), eigvecs.float().cpu()
 
 
 def compute_source_cov_hook():
@@ -148,6 +154,8 @@ def compute_source_cov_from_kb(model, kb_root: str, modality: str,
     result = {}
     for layer_name, acc in stats.items():
         mean, cov, eigvals, eigvecs = acc.stats()
+        if mean is None:
+            continue
         result[layer_name] = {
             "mean": mean.tolist(),
             "eigvals": eigvals.tolist(),

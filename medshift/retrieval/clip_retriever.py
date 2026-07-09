@@ -56,7 +56,6 @@ class BiomedCLIPRetriever:
         import open_clip
         repo = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
         if local_dir:
-            # load from local snapshot path
             model, _, preprocess = open_clip.create_model_and_transforms(
                 f"hf-hub:{repo}" if not os.path.isdir(local_dir) else local_dir,
                 pretrained=local_dir if os.path.isdir(local_dir) else None,
@@ -70,14 +69,58 @@ class BiomedCLIPRetriever:
         return cls(model, preprocess, tokenizer, device=device)
 
     @classmethod
+    def from_local_clip(cls, device: str = "cuda") -> "BiomedCLIPRetriever":
+        """Load from cached openai/clip-vit-large-patch14-336 (no network)."""
+        from transformers import CLIPModel, CLIPProcessor
+        snap_dir = ("/root/.cache/huggingface/hub/models--openai--"
+                    "clip-vit-large-patch14-336/snapshots/")
+        snap = os.listdir(snap_dir)[0]
+        sd_path = os.path.join(snap_dir, snap)
+        model = CLIPModel.from_pretrained(sd_path, local_files_only=True,
+                                          use_safetensors=True)
+        proc = CLIPProcessor.from_pretrained(sd_path, local_files_only=True)
+        model = model.to(device).eval()
+        class _Wrapper:
+            def __init__(self, m, p):
+                self.m = m; self.p = p
+                self.eval_mode = False
+            def eval(self):
+                self.m.eval(); self.eval_mode = True
+                return self
+            def __call__(self, images=None, text=None, return_tensors="pt",
+                         padding=False, truncation=False):
+                """Delegate to CLIPProcessor so encode_image works."""
+                return self.p(images=images, text=text, return_tensors=return_tensors,
+                              padding=padding, truncation=truncation)
+            def encode_image(self, x):
+                """Direct encode (bypass preprocess). Used by build_index."""
+                inp = self.p(images=x, return_tensors="pt").to(self.m.device)
+                inp = {k: v.to(self.m.device) if hasattr(v, 'to') else v
+                       for k, v in inp.items()}
+                f = self.m.get_image_features(**inp).pooler_output
+                return f / f.norm(p=2, dim=-1, keepdim=True)
+            def encode_text(self, t):
+                inp = self.p(text=[t], return_tensors="pt", padding=True,
+                            truncation=True).to(self.m.device)
+                inp = {k: v.to(self.m.device) if hasattr(v, 'to') else v
+                       for k, v in inp.items()}
+                f = self.m.get_text_features(**inp).pooler_output
+                return f / f.norm(p=2, dim=-1, keepdim=True)
+        wrapper = _Wrapper(model, proc)
+        retriever = cls(wrapper, proc, proc.tokenizer, device=device)
+        retriever._is_local_clip = True
+        return retriever
+
+    @classmethod
     def from_kb(cls, modality: str, kb_root: Optional[str] = None,
-                device: str = "cuda") -> "BiomedCLIPRetriever":
+                device: str = "cuda",
+                use_local_clip: bool = True) -> "BiomedCLIPRetriever":
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from retrieval.kb_builder import load_kb
         if kb_root is None:
             kb_root = os.path.join(os.path.dirname(__file__), "../../data/knowledge_bases")
-        r = cls.from_pretrained(device=device)
+        r = cls.from_local_clip(device=device) if use_local_clip else cls.from_pretrained(device=device)
         entries = load_kb(modality, kb_root=kb_root)
         r.entries = entries
         return r
@@ -87,19 +130,34 @@ class BiomedCLIPRetriever:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def encode_image(self, image: Image.Image) -> np.ndarray:
+        """Encode a PIL image to normalized embedding. Handles both open_clip
+        (tensor preprocess) and local CLIP (processor returning dict)."""
         from torchvision import transforms
         img = image.convert("RGB").resize((self.IMAGE_SIZE, self.IMAGE_SIZE),
                                           Image.BILINEAR)
-        x = self.preprocess(img).unsqueeze(0).to(self.device)
-        feat = self.model.encode_image(x)
-        feat = feat / feat.norm(dim=-1, keepdim=True)
+        x = self.preprocess(img)  # tensor (open_clip) or dict (local CLIP)
+        if hasattr(self.model, 'encode_image'):
+            # local CLIP wrapper: pass image directly
+            feat = self.model.encode_image(img)
+        elif isinstance(x, torch.Tensor):
+            x = x.unsqueeze(0).to(self.device)
+            feat = self.model.encode_image(x)
+        else:
+            # CLIPProcessor dict: pass through model
+            x = {k: v.unsqueeze(0).to(self.device) if hasattr(v, 'unsqueeze') else v
+                 for k, v in x.items()}
+            f = self.model.get_image_features(**x).pooler_output
+            feat = f / f.norm(p=2, dim=-1, keepdim=True)
         return feat.cpu().float().numpy().flatten()
 
     @torch.no_grad()
     def encode_text(self, text: str) -> np.ndarray:
-        tok = self.tokenizer([text]).to(self.device)
-        feat = self.model.encode_text(tok)
-        feat = feat / feat.norm(dim=-1, keepdim=True)
+        if hasattr(self.model, 'encode_text'):
+            feat = self.model.encode_text(text)
+        else:
+            tok = self.tokenizer([text]).to(self.device)
+            feat = self.model.encode_text(tok)
+            feat = feat / feat.norm(dim=-1, keepdim=True)
         return feat.cpu().float().numpy().flatten()
 
     # ------------------------------------------------------------------
@@ -129,8 +187,18 @@ class BiomedCLIPRetriever:
               f"-> {self.image_embeddings.shape}")
 
     def _feat_dim(self) -> int:
-        # BiomedCLIP vit_base_patch16_224 -> 512-dim shared space
-        return 512
+        """Detect feature dimension from the loaded model."""
+        if hasattr(self, '_feat_dim_cached'):
+            return self._feat_dim_cached
+        # Try to infer from model
+        try:
+            test_img = Image.new('RGB', (224,224), color='gray')
+            f = self.encode_image(test_img)
+            dim = len(f)
+        except Exception:
+            dim = 768  # fallback for CLIP-ViT-L
+        self._feat_dim_cached = dim
+        return dim
 
     # ------------------------------------------------------------------
     # Retrieval
