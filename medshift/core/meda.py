@@ -188,8 +188,8 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
             inp = {k: v.to(dev) if isinstance(v, torch.Tensor) else v
                    for k, v in inp.items()}
             with torch.no_grad():
-                model.model.generate(**inp, max_new_tokens=8, do_sample=False,
-                                     pad_token_id=model.tokenizer.eos_token_id)
+                # FIX: single forward pass (generate does multiple steps, hook captures wrong position)
+                model.model(**inp, use_cache=True, return_dict=True)
             # capture last-token hidden per layer
             for ln in layer_names:
                 if ln in captured:
@@ -207,8 +207,7 @@ def build_steering_from_kb(model, kb_root: str, modality: str,
             inp = {k: v.to(dev) if isinstance(v, torch.Tensor) else v
                    for k, v in inp.items()}
             with torch.no_grad():
-                model.model.generate(**inp, max_new_tokens=8, do_sample=False,
-                                     pad_token_id=model.tokenizer.eos_token_id)
+                model.model(**inp, use_cache=True, return_dict=True)
             for ln in layer_names:
                 if ln in captured:
                     h = captured[ln]
